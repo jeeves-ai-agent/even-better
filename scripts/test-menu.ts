@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseMenu, classifyMenu, isCodexApprovalScreen } from "../src/parse.js";
+import { parseMenu, classifyMenu, isCodexApprovalScreen, isClaudeTrustPrompt } from "../src/parse.js";
 
 // Representative screens captured live from the real TUIs. The highlighted
 // option carries a per-agent selection marker: `❯` (claude), `›` (codex).
@@ -128,3 +128,43 @@ const codexStaleEchoAboveDialog = [
 ].join("\n");
 test("codex live dialog below a stale › echo IS detected", () => assert.ok(isCodexApprovalScreen(codexStaleEchoAboveDialog)));
 test("claude permission not codex-detected", () => assert.ok(!isCodexApprovalScreen(claudePerm)));
+
+// Claude's one-time "trust this folder?" dialog, captured live on a fresh
+// launch in a brand-new cwd — the New Session bootstrap must recognize this
+// (and only this) screen to auto-dismiss it before the first real prompt.
+const claudeTrustPrompt = [
+  " claude --dangerously-skip-permissions",
+  "",
+  "──────────────────────────────────────────────────────",
+  " Accessing workspace:",
+  "",
+  " /tmp/eb-verify-scratch-cwd",
+  "",
+  " Quick safety check: Is this a project you created or",
+  " one you trust? (Like your own code, a well-known",
+  " open source project, or work from your team). If",
+  " not, take a moment to review what's in this folder",
+  " first.",
+  "",
+  " Claude Code'll be able to read, edit, and execute",
+  " files here.",
+  "",
+  " Security guide",
+  "",
+  " ❯ 1. Yes, I trust this folder",
+  "   2. No, exit",
+  "",
+  " Enter to confirm · Esc to cancel",
+].join("\n");
+test("claude trust dialog detected", () => assert.ok(isClaudeTrustPrompt(claudeTrustPrompt)));
+test("ordinary claude permission prompt not mistaken for the trust dialog", () => assert.ok(!isClaudeTrustPrompt(claudePerm)));
+test("plain prose (no menu at all) not mistaken for the trust dialog", () => assert.ok(!isClaudeTrustPrompt("just some output\nwith no menu here")));
+// A real tool asking to touch a file named to look like a trust prompt must
+// not be mistaken for the actual dialog — only the exact option pair matches.
+const trustLookalikeToolPrompt = [
+  " Do you want Claude to trust this folder and write to it?",
+  " ❯ 1. Yes",
+  "   2. No",
+].join("\n");
+test("a tool-permission prompt merely mentioning 'trust' is not mistaken for the dialog", () =>
+  assert.ok(!isClaudeTrustPrompt(trustLookalikeToolPrompt)));

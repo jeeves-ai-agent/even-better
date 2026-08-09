@@ -202,6 +202,24 @@ export function classifyMenu(menu: ParsedMenu): ClassifiedMenu {
  * unmarked numbered *prose* lists; and `›` is also codex's input-prompt prefix —
  * but only a live dialog puts a marked row directly above the footer.
  */
+/**
+ * Detects Claude Code's one-time "trust this folder?" dialog, shown on the
+ * very first launch in a directory it hasn't seen before — distinct from any
+ * per-tool permission prompt, and the one screen the New Session bootstrap
+ * (index.ts) auto-dismisses before sending the user's first real prompt (a
+ * brand-new workspace always hits it, and left alone it swallows that first
+ * prompt's keystrokes instead of the chat input). Matched narrowly on the
+ * exact two-option pair Claude renders, not a loose "trust" keyword, so a
+ * REAL tool-permission prompt that happens to mention "trust" is never
+ * mistaken for it and auto-approved.
+ */
+export function isClaudeTrustPrompt(text: string): boolean {
+  const menu = parseMenu(text);
+  if (!menu || menu.options.length !== 2) return false;
+  const [first, second] = menu.options;
+  return /^yes,\s*i trust this folder$/i.test(first.label.trim()) && /^no,\s*exit$/i.test(second.label.trim());
+}
+
 export function isCodexApprovalScreen(text: string): boolean {
   if (parseMenu(text) === null) return false;
   const lines = text.split("\n");

@@ -30,7 +30,45 @@ const SAFE_METHODS = new Set([
   "workspace.create",
   "workspace.close",
   "pane.report_agent",
+  // New Session flow (new-session.ts): starts a Claude agent in a
+  // freshly created workspace's pane. Launches a process in an existing pane
+  // only — never reachable to reconfigure or stop the herdr server itself.
+  "agent.start",
 ]);
+
+/** Pulls the session name out of a named-session socket path
+ *  (.config/herdr/sessions/<name>/herdr.sock); undefined for the default
+ *  (unnamed-session) socket, which has no /sessions/ segment. Pure — takes the
+ *  socket path as a parameter so it's testable without touching env/module state. */
+function parseHerdrSessionName(socketPath: string): string | undefined {
+  const m = socketPath.replace(/\\/g, "/").match(/\/sessions\/([^/]+)\/herdr\.sock$/);
+  return m?.[1];
+}
+
+/** Derives the Herdr session name the New Session flow labels its new
+ *  workspace/agent with — HERDR_SESSION wins when set, else it's parsed from
+ *  the socket path. Throws rather than guessing when neither yields a name
+ *  (e.g. the default unnamed-session socket with no HERDR_SESSION), since New
+ *  Session must create the workspace in the SAME named session the bridge is
+ *  attached to, not silently fall back to some other one. Exported as a pure
+ *  function (explicit socketPath/envSession) so it's unit-testable; see
+ *  herdrSessionName() for the env-reading wrapper actually used at runtime. */
+export function deriveHerdrSessionName(socketPath: string, envSession: string | undefined): string {
+  const fromEnv = envSession?.trim();
+  if (fromEnv) return fromEnv;
+  const fromSocket = parseHerdrSessionName(socketPath);
+  if (fromSocket) return fromSocket;
+  throw new Error(
+    `cannot determine the Herdr session name: set HERDR_SESSION explicitly, or point HERDR_SOCKET ` +
+      `at a named session's socket (…/sessions/<name>/herdr.sock); current HERDR_SOCKET=${socketPath}`,
+  );
+}
+
+/** The Herdr session name the running process is attached to, for the New
+ *  Session flow (new-session.ts). */
+export function herdrSessionName(): string {
+  return deriveHerdrSessionName(SOCKET_PATH, process.env.HERDR_SESSION);
+}
 
 /** True when herdr's socket is present — used for startup mux auto-selection. */
 export function herdrAvailable(): Promise<boolean> {
@@ -181,11 +219,71 @@ export interface AgentInfo {
   focused: boolean;
   cwd: string;
   foreground_cwd: string;
+  interactive_ready?: boolean;
 }
 
 export async function agentList(): Promise<AgentInfo[]> {
   const r = await call<{ agents: AgentInfo[] }>("agent.list");
   return r.agents ?? [];
+}
+
+// ── New Session flow (new-session.ts) ──────────────────
+
+export interface WorkspaceCreateResult {
+  workspaceId: string;
+  paneId: string;
+}
+
+/** Creates a workspace (unfocused, so it doesn't steal the terminal's
+ *  foreground) and returns its root pane — the pane New Session starts a
+ *  Claude agent in. */
+export async function workspaceCreate(cwd: string, label: string): Promise<WorkspaceCreateResult> {
+  const r = await call<{
+    workspace: { workspace_id: string };
+    root_pane: { pane_id: string };
+  }>("workspace.create", { cwd, label, focus: false });
+  return { workspaceId: r.workspace.workspace_id, paneId: r.root_pane.pane_id };
+}
+
+export async function workspaceClose(workspaceId: string): Promise<void> {
+  await call("workspace.close", { workspace_id: workspaceId });
+}
+
+/** Starts a Claude agent in an existing pane (must be at its interactive shell
+ *  prompt — true for a pane workspaceCreate just made). Returns as soon as the
+ *  launch is accepted; it does NOT wait for interactive readiness — poll
+ *  paneInteractiveReady for that (see new-session.ts's waitUntilReady). */
+export async function agentStart(opts: { name: string; paneId: string; timeoutMs: number }): Promise<void> {
+  const params = {
+    name: opts.name,
+    kind: "claude",
+    pane_id: opts.paneId,
+    timeout_ms: opts.timeoutMs,
+  };
+  // A pane workspace.create just returned can briefly reject agent.start with
+  // agent_pane_busy ("not an available shell") — its shell prompt hasn't
+  // finished initializing yet (observed live; not reproducible with a
+  // dedicated fresh pane, so likely load-dependent). Bounded retry rather than
+  // failing New Session on a race that clears itself in well under a second.
+  const maxAttempts = 4;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await call("agent.start", params);
+      return;
+    } catch (err) {
+      const transient = (err as Error).message.startsWith("agent_pane_busy");
+      if (!transient || attempt === maxAttempts) throw err;
+      await new Promise((r) => setTimeout(r, 300 * attempt));
+    }
+  }
+}
+
+/** Whether the agent in `paneId` is ready to receive input (past its startup
+ *  banner/trust screen). Reuses the already-allowlisted agent.list rather than
+ *  adding a second allowlisted method for a single-pane lookup. */
+export async function paneInteractiveReady(paneId: string): Promise<boolean> {
+  const agents = await agentList();
+  return agents.find((a) => a.pane_id === paneId)?.interactive_ready === true;
 }
 
 export async function paneRead(

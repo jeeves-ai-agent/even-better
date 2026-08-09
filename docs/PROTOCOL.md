@@ -68,11 +68,46 @@ All under `/api`, bearer-token auth (`?token=` or `Authorization: Bearer`).
 | GET | `/status` | one pane's state |
 | GET | `/messages` | ring-buffer replay (`?after=`) |
 | GET | `/update-check` | version check (static) |
-| GET | `/sessions/:id/history` | history (currently empty) |
-| POST | `/prompt` | inject a user turn (`{ text, sessionId }`) |
+| GET | `/sessions/:id/history?limit=` | recent turns from the session's transcript |
+| POST | `/prompt` | inject a user turn (`{ text, sessionId, cwd? }`) — see [New Session](#new-session-sessionid-null) |
 | POST | `/permission-response` | answer a `permission_request` (`{ sessionId, decision }`) |
 | POST | `/question-response` | answer a `user_question` (`{ sessionId, answer }`) |
 | POST | `/interrupt` | send Escape to the pane (`{ sessionId }`) |
+
+### History
+
+`GET /sessions/:id/history` mirrors even-terminal 0.8.1's `getHistory`
+contract: read from the same jsonl transcript live streaming already tails
+(`src/history.ts`, reusing `parseEntry`/`CodexEntryParser` — no new
+heuristics), reduced to text-only turns (tool calls/results excluded).
+Response: `{ history: [{ role: "user" | "assistant", text }] }`, most-recent
+`?limit=` turns (default 10) in chronological order. Never a hard error — an
+unknown pane, or one whose transcript hasn't resolved yet, returns
+`{ history: [] }` with **HTTP 200**, matching 0.8.1's own fail-soft contract.
+⚠️ **Deviations:** `:id` is even-better's pane id (same as every other
+route), not the provider's raw session id — resolved via
+`bridge.agentSessionId`, no second discovery path; and the cap is **50**
+(`MAX_HISTORY_LIMIT`), not 0.8.1's 10.
+
+### New Session (`sessionId: null`)
+
+On the Herdr backend, `POST /prompt` with `sessionId: null` creates a
+brand-new workspace and starts a Claude agent in it, instead of routing to an
+existing pane (`focusedOrFirstBridge`) — see `src/new-session.ts`. An
+optional `cwd` must be an absolute, existing directory (**400** otherwise);
+omitted, it falls back to `NEW_SESSION_CWD`, then `HOME`, then the server's
+own cwd. On any failure after the workspace exists (agent start, readiness,
+or the caller never picking up the new pane), the workspace is closed rather
+than leaked.
+
+Claude's one-time workspace-trust dialog is auto-accepted **only** for that
+server-default cwd (an operator-controlled value); a caller-supplied `cwd`
+leaves the dialog for a human to approve instead of silently granting it —
+the response is `{ ok: false, sessionId, provider, error: "trust_required",
+message }` and the dialog surfaces as a normal `user_question` the app can
+answer via `/question-response`, after which the same `sessionId` accepts a
+normal prompt. cmux has no equivalent named-workspace API yet, so a null
+`sessionId` there keeps the pre-feature `focusedOrFirstBridge` fallback.
 
 ## Transport & resilience
 
@@ -145,8 +180,12 @@ Reconnect behavior, as recorded by the `src/sse.ts` logging:
 **Intentional deviations from 0.8.1 (do not revert):** last-20 replay cap;
 immediate `status` snapshot pushed on connect (else an app connecting while idle
 waits forever for a transition); `retry: 2000` + socket-error logging; timing-safe
-token comparison; always-500 `/prompt` errors; stubbed `/update-check` &
-`/sessions/:id/history`; no `/debug/*` or `/metrics` routes.
+token comparison; `/prompt` errors are 500 except an invalid `cwd` (400) and a
+caller-cwd New Session awaiting trust approval (202 `trust_required` — see
+[New Session](#new-session-sessionid-null)); `/sessions/:id/history` keyed by
+pane id with a 50-item cap (0.8.1: raw session id, cap 10 — see
+[History](#history)); stubbed `/update-check`; no `/debug/*` or `/metrics`
+routes.
 
 ## Host limitation: one agent type per connection
 

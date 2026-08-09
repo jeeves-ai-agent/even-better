@@ -11,13 +11,31 @@ import {
   getBridge,
   getOrCreateBridge,
   refreshAgents,
+  type PaneBridge,
 } from "./bridge.js";
 import { emit, getMessages, sseHandler } from "./sse.js";
 import { getMux, setMux, type Multiplexer } from "./multiplexer.js";
-import { HerdrMultiplexer, herdrAvailable } from "./herdr.js";
+import {
+  HerdrMultiplexer,
+  herdrAvailable,
+  herdrSessionName,
+  workspaceCreate,
+  workspaceClose,
+  agentStart,
+  paneInteractiveReady,
+} from "./herdr.js";
 import { CmuxMultiplexer, cmuxAvailable } from "./cmux.js";
+import {
+  createNewSession,
+  resolveNewSessionCwd,
+  shouldAutoTrustCwd,
+  waitForAttach,
+  InvalidCwdError,
+  type NewSessionRpc,
+} from "./new-session.js";
+import { readClaudeHistory, readCodexHistory, clampHistoryLimit } from "./history.js";
 import { logEvent, eventLogPath, logMode, writesEventLog, consoleLogPath, installConsoleTee } from "./log.js";
-import { extractModel } from "./parse.js";
+import { extractModel, isClaudeTrustPrompt } from "./parse.js";
 import { readClaudeModel } from "./transcript.js";
 import { readCodexModel } from "./codex-transcript.js";
 import { startExpose, exposeProviderNames } from "./expose.js";
@@ -330,10 +348,110 @@ api.get("/update-check", (_req, res) => {
   });
 });
 
+// Real Herdr wiring for the New Session flow (src/new-session.ts). The agent
+// launches without extra CLI args — a New Session pane behaves exactly like a
+// `claude` a human typed into a fresh pane, including normal interactive
+// permission prompts (handled by the existing PaneBridge machinery), rather
+// than silently granting --dangerously-skip-permissions.
+const herdrRpc: NewSessionRpc = {
+  createWorkspace: (cwd, label) => workspaceCreate(cwd, label),
+  startAgent: (opts) => agentStart(opts),
+  isReady: (paneId) => paneInteractiveReady(paneId),
+  closeWorkspace: (workspaceId) => workspaceClose(workspaceId),
+};
+
+// Claude's one-time "trust this folder?" dialog appears on a brand-new pane's
+// very first launch, before any prompt has been sent — left alone it eats the
+// first prompt's keystrokes (they land in the dialog, not the chat input), so
+// a New Session's first message would silently vanish. Dismissed here, before
+// refreshAgents() attaches a PaneBridge, so the pane is a normal ready-for-
+// input agent by the time the shared bridge.prompt() path sends the real
+// text. Narrowly pattern-matched (isClaudeTrustPrompt) — this never touches
+// the general permission machinery, so a real tool-permission prompt during
+// the actual conversation still always goes to the human via the app.
+//
+// Auto-trust policy (review finding #2, .review-fix-1.txt): this function is
+// ONLY called for the server's own configured/default cwd (shouldAutoTrustCwd
+// in new-session.ts) — never for a caller-supplied cwd, whose value comes
+// from the HTTP request rather than the operator. Auto-accepting Claude's
+// "let it read/edit/execute files here" prompt on the caller's behalf for an
+// arbitrary directory would be an unreviewed grant of exactly the access that
+// dialog exists to gate. For a caller-supplied cwd the dialog is left open;
+// /api/prompt detects it below and asks the human to approve it explicitly
+// (via the normal user_question the blocked pane already surfaces) instead of
+// silently bypassing it.
+async function dismissStartupTrustPrompt(paneId: string): Promise<void> {
+  const mux = getMux();
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const screen = await readStableScreen(mux, paneId);
+    if (screen === null) return; // pane gone
+    if (!isClaudeTrustPrompt(screen)) return; // stable AND not the dialog — genuinely done
+    await mux.send(paneId, "", ["Enter"]);
+  }
+}
+
+// Reads paneId's screen, waiting for it to stop changing (two consecutive
+// identical, non-blank reads) before returning it. A screen caught mid-render
+// — right after interactive_ready flips (herdr's own PTY-responsive signal
+// fires before Claude has painted anything, measured: blank at +300ms, the
+// dialog/banner not fully drawn until +800ms) or right after an Enter
+// keypress before the TUI redraws — must never be classified: reading it too
+// early made dismissStartupTrustPrompt conclude "no trust dialog to dismiss"
+// while the dialog was still about to render, so the real first prompt's
+// keystrokes landed in it once it did (reproduced live). Used both BEFORE
+// classifying (so a not-yet-rendered dialog isn't missed) and AFTER pressing
+// Enter (the loop's next iteration re-stabilizes before re-checking), closing
+// the race on both sides. Bounded so a stuck render can't hang the request —
+// falls back to the last read rather than blocking forever.
+async function readStableScreen(mux: Multiplexer, paneId: string, maxAttempts = 10): Promise<string | null> {
+  let prev: string | null = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    let screen: string;
+    try {
+      screen = await mux.read(paneId, 45);
+    } catch {
+      return null;
+    }
+    if (prev !== null && screen === prev && screen.trim().length > 0) return screen;
+    prev = screen;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return prev;
+}
+
+// A newly started pane needs a moment to be picked up by listPanes() before
+// getOrCreateBridge finds it — mirrors the bounded-retry pattern used
+// elsewhere in the bridge (e.g. waitUnblocked) rather than a single fixed
+// wait. If the pane is never picked up, waitForAttach closes the workspace
+// createNewSession already made (review finding #1) rather than leaking it.
+async function bridgeForNewSession(cwd: string, autoTrust: boolean): Promise<PaneBridge | undefined> {
+  const { paneId, workspaceId } = await createNewSession(herdrRpc, { cwd, sessionLabel: herdrSessionName() });
+  if (autoTrust) await dismissStartupTrustPrompt(paneId);
+  return waitForAttach(
+    async () => {
+      await refreshAgents();
+      return getBridge(paneId);
+    },
+    workspaceClose,
+    workspaceId,
+    5,
+    150,
+  );
+}
+
+/** True while paneId is still sitting at Claude's startup trust dialog —
+ *  used only to decide the response for a caller-supplied-cwd New Session
+ *  (see shouldAutoTrustCwd); never wired into the general permission flow. */
+async function isShowingTrustPrompt(paneId: string): Promise<boolean> {
+  const screen = await readStableScreen(getMux(), paneId);
+  return screen !== null && isClaudeTrustPrompt(screen);
+}
+
 api.post("/prompt", async (req, res) => {
-  const { text, sessionId } = (req.body ?? {}) as {
+  const { text, sessionId, cwd } = (req.body ?? {}) as {
     text?: string;
     sessionId?: string;
+    cwd?: unknown;
   };
   if (!text || typeof text !== "string") {
     res.status(400).json({ error: "Missing 'text' field" });
@@ -341,19 +459,57 @@ api.post("/prompt", async (req, res) => {
   }
   try {
     let bridge = sessionId ? await getOrCreateBridge(sessionId) : undefined;
+    let newSessionNeedsTrustApproval = false;
     if (!bridge) {
-      const agents = await refreshAgents();
-      bridge = focusedOrFirstBridge(agents);
+      if (sessionId) {
+        // Preserve the pre-existing fallback for a stale/unknown sessionId
+        // byte-for-byte: route to the focused/first existing agent.
+        const agents = await refreshAgents();
+        bridge = focusedOrFirstBridge(agents);
+      } else if (getMux().name === "herdr") {
+        // A null sessionId ("New Session" in the app) creates a fresh Herdr
+        // workspace + Claude agent instead of routing to an existing one.
+        // cwd was not supplied by the caller only when it's exactly undefined
+        // (an explicit cwd, even one that resolves to the same path as the
+        // default, is still caller-supplied for trust purposes).
+        const autoTrust = shouldAutoTrustCwd(cwd !== undefined);
+        bridge = await bridgeForNewSession(resolveNewSessionCwd(cwd), autoTrust);
+        if (bridge && !autoTrust && (await isShowingTrustPrompt(bridge.paneId))) {
+          newSessionNeedsTrustApproval = true;
+        }
+      } else {
+        // No named-session workspace API for cmux yet — keep the pre-feature
+        // behavior (route to the focused/first existing agent) rather than
+        // erroring, so cmux users aren't broken by a Herdr-only feature.
+        const agents = await refreshAgents();
+        bridge = focusedOrFirstBridge(agents);
+      }
     }
     if (!bridge) {
       res.status(404).json({ error: "No agent pane found" });
+      return;
+    }
+    if (newSessionNeedsTrustApproval) {
+      // Never auto-approve a caller-supplied cwd's workspace-trust dialog (see
+      // dismissStartupTrustPrompt) — the pane is fully tracked and its dialog
+      // already surfaced as a normal user_question over SSE; the human must
+      // answer it (POST /api/question-response) before a prompt can be typed,
+      // same as any other blocked pane.
+      res.status(202).json({
+        ok: false,
+        sessionId: bridge.paneId,
+        provider: bridge.provider,
+        error: "trust_required",
+        message: "New session created — approve the workspace-trust prompt (the pending question) before sending messages.",
+      });
       return;
     }
     console.log(`[prompt] pane=${bridge.paneId} text=${text.slice(0, 80)}`);
     await bridge.prompt(text);
     res.status(202).json({ ok: true, sessionId: bridge.paneId, provider: bridge.provider });
   } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
+    const status = err instanceof InvalidCwdError ? 400 : 500;
+    res.status(status).json({ error: (err as Error).message });
   }
 });
 
@@ -438,8 +594,30 @@ api.get("/messages", (req, res) => {
   });
 });
 
-api.get("/sessions/:id/history", (_req, res) => {
-  res.json({ history: [] });
+// `:id` is the bridge's pane id (same identifier /api/sessions, /api/events,
+// /api/prompt all use), resolved to the pane's CURRENT agent session id via
+// the same field the bridge itself tails (bridge.agentSessionId) — no second
+// pane->session discovery path. Mirrors even-terminal 0.8.1's own contract:
+// always HTTP 200, `{ history: [...] }` on success or `{ history: [], error }`
+// on failure — a history fetch must never surface as a hard error to the app.
+api.get("/sessions/:id/history", async (req, res) => {
+  const paneId = req.params.id;
+  const rawLimit = req.query.limit;
+  const limit = clampHistoryLimit(typeof rawLimit === "string" ? Number(rawLimit) : undefined);
+  const bridge = getBridge(paneId);
+  const sessionId = bridge?.agentSessionId;
+  if (!sessionId) {
+    // Unknown pane, or a known pane whose transcript hasn't resolved yet.
+    res.json({ history: [] });
+    return;
+  }
+  try {
+    const history =
+      bridge.provider === "codex" ? await readCodexHistory(sessionId, limit) : await readClaudeHistory(sessionId, limit);
+    res.json({ history });
+  } catch (err) {
+    res.json({ history: [], error: (err as Error).message });
+  }
 });
 
 // ── startup ────────────────────────────────────────────
