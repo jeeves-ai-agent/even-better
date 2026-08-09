@@ -10,7 +10,12 @@ import type {
   StatusSub,
 } from "./multiplexer.js";
 
-const SOCKET_PATH = path.join(os.homedir(), ".config", "herdr", "herdr.sock");
+// Default is herdr's unnamed session socket. HERDR_SOCKET overrides it so
+// even-better can attach to a named session (e.g. `herdr --session jeeves`),
+// whose socket lives under .config/herdr/sessions/<name>/herdr.sock.
+const SOCKET_PATH =
+  process.env.HERDR_SOCKET?.trim() ||
+  path.join(os.homedir(), ".config", "herdr", "herdr.sock");
 
 // Methods we allow ourselves to call. Anything server.* is deliberately
 // excluded — reload/stop/handoff must never be reachable from the bridge.

@@ -1,0 +1,24 @@
+[Unit]
+Description=Even G2 terminal bridge for Herdr/Claude Code
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/repos/even-better
+EnvironmentFile=/home/ubuntu/.config/even-better/env
+ExecStart=/home/ubuntu/.local/bin/bun run start
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/.local/state/even-better /home/ubuntu/.config/even-better /home/ubuntu/.config/herdr /home/ubuntu/.claude /home/ubuntu/.codex /home/ubuntu/.even-better
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
