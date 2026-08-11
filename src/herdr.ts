@@ -254,20 +254,28 @@ export async function workspaceClose(workspaceId: string): Promise<void> {
  *  kind (`claude` | `codex` | `cursor`, see provider.ts's herdrAgentKind);
  *  omitted it stays `claude`, the pre-existing default. It travels as a JSON-RPC
  *  parameter — herdr builds the command line, so no caller value is ever
- *  interpolated into a shell command here. Returns as soon as the launch is
- *  accepted; it does NOT wait for interactive readiness — poll
- *  paneInteractiveReady for that (see new-session.ts's waitUntilReady). */
+ *  interpolated into a shell command here. A `claude` agent always gets
+ *  --remote-control as an executable arg (equivalent to CLI
+ *  `herdr agent start ... -- --remote-control`, via AgentStartParams.args in
+ *  Herdr 0.7.5's socket schema) so a New Session pane comes up with Claude Code
+ *  Remote Control enabled — never --dangerously-skip-permissions, see
+ *  index.ts's herdrRpc wiring comment. Other kinds get no args: the flag is
+ *  Claude's. Returns as soon as the launch is accepted; it does NOT wait for
+ *  interactive readiness — poll paneInteractiveReady for that (see
+ *  new-session.ts's waitUntilReady). */
 export async function agentStart(opts: {
   name: string;
   paneId: string;
   timeoutMs: number;
   kind?: string;
 }): Promise<void> {
+  const kind = opts.kind ?? "claude";
   const params = {
     name: opts.name,
-    kind: opts.kind ?? "claude",
+    kind,
     pane_id: opts.paneId,
     timeout_ms: opts.timeoutMs,
+    ...(kind === "claude" ? { args: ["--remote-control"] } : {}),
   };
   // A pane workspace.create just returned can briefly reject agent.start with
   // agent_pane_busy ("not an available shell") — its shell prompt hasn't
