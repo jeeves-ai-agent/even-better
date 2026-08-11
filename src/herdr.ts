@@ -252,13 +252,19 @@ export async function workspaceClose(workspaceId: string): Promise<void> {
 /** Starts a Claude agent in an existing pane (must be at its interactive shell
  *  prompt — true for a pane workspaceCreate just made). Returns as soon as the
  *  launch is accepted; it does NOT wait for interactive readiness — poll
- *  paneInteractiveReady for that (see new-session.ts's waitUntilReady). */
+ *  paneInteractiveReady for that (see new-session.ts's waitUntilReady). Always
+ *  passes --remote-control as a Claude executable arg (equivalent to CLI
+ *  `herdr agent start ... -- --remote-control`, via AgentStartParams.args in
+ *  Herdr 0.7.5's socket schema) so a New Session pane comes up with Claude
+ *  Code Remote Control enabled — never --dangerously-skip-permissions, see
+ *  index.ts's herdrRpc wiring comment. */
 export async function agentStart(opts: { name: string; paneId: string; timeoutMs: number }): Promise<void> {
   const params = {
     name: opts.name,
     kind: "claude",
     pane_id: opts.paneId,
     timeout_ms: opts.timeoutMs,
+    args: ["--remote-control"],
   };
   // A pane workspace.create just returned can briefly reject agent.start with
   // agent_pane_busy ("not an available shell") — its shell prompt hasn't

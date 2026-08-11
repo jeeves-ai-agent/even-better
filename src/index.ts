@@ -348,11 +348,12 @@ api.get("/update-check", (_req, res) => {
   });
 });
 
-// Real Herdr wiring for the New Session flow (src/new-session.ts). The agent
-// launches without extra CLI args — a New Session pane behaves exactly like a
-// `claude` a human typed into a fresh pane, including normal interactive
-// permission prompts (handled by the existing PaneBridge machinery), rather
-// than silently granting --dangerously-skip-permissions.
+// Real Herdr wiring for the New Session flow (src/new-session.ts). herdr.ts's
+// agentStart always adds --remote-control so a New Session pane comes up with
+// Claude Code Remote Control enabled by default; it otherwise behaves exactly
+// like a `claude` a human typed into a fresh pane, including normal
+// interactive permission prompts (handled by the existing PaneBridge
+// machinery), rather than silently granting --dangerously-skip-permissions.
 const herdrRpc: NewSessionRpc = {
   createWorkspace: (cwd, label) => workspaceCreate(cwd, label),
   startAgent: (opts) => agentStart(opts),
