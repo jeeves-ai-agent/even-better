@@ -9,6 +9,7 @@ import {
   MAX_HISTORY_LIMIT,
   readClaudeHistory,
   readCodexHistory,
+  readHistory,
 } from "../src/history.js";
 
 // ── clampHistoryLimit: pure, no filesystem ─────────────
@@ -178,3 +179,33 @@ test("readCodexHistory: an unresolved session id yields an empty array, not an e
   withTempCodexHome(async () => {
     assert.deepEqual(await readCodexHistory("no-such-codex-session", 10), []);
   }));
+
+// ── readHistory: provider dispatch. Cursor has no transcript parser, so its
+// history is empty — and must NOT be parsed as Claude jsonl even when a Claude
+// session with the same id exists (the route stays HTTP 200 either way). ─────
+
+test("readHistory: claude dispatches to the Claude transcript parser", () =>
+  withTempHome(async (home) => {
+    writeClaudeFixture(home, "session-dispatch", claudeFixtureLines);
+    assert.deepEqual(await readHistory("claude", "session-dispatch", 2), [
+      { role: "user", text: "second question" },
+      { role: "assistant", text: "second answer" },
+    ]);
+  }));
+
+test("readHistory: codex dispatches to the Codex rollout parser", () =>
+  withTempCodexHome(async (codexHome) => {
+    writeCodexFixture(codexHome, "codex-dispatch", codexFixtureLines);
+    assert.deepEqual(await readHistory("codex", "codex-dispatch", 1), [{ role: "assistant", text: "Done." }]);
+  }));
+
+test("readHistory: cursor returns an empty history without parsing anything", () =>
+  withTempHome(async (home) => {
+    // A Claude transcript exists under this very session id: cursor must still
+    // return [] rather than replaying someone else's conversation.
+    writeClaudeFixture(home, "shared-id", claudeFixtureLines);
+    assert.deepEqual(await readHistory("cursor", "shared-id", 10), []);
+  }));
+
+test("readHistory: cursor never throws, even for an unresolvable session id", async () =>
+  assert.deepEqual(await readHistory("cursor", "no-such-session", 10), []));

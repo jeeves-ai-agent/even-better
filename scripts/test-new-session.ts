@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import os from "node:os";
 import {
   createNewSession,
+  InvalidProviderError,
   resolveNewSessionCwd,
+  resolveNewSessionProvider,
   shouldAutoTrustCwd,
   uniqueSessionName,
   waitForAttach,
@@ -241,6 +243,68 @@ test("waitForAttach: a close failure on the give-up path is swallowed, not throw
     noopSleep,
   );
   assert.equal(value, undefined);
+});
+
+// ── resolveNewSessionProvider: which agent a New Session starts. The value
+// comes from the HTTP request, so an unknown one must be rejected rather than
+// silently starting some other agent. ───────────────────────────────────────
+
+test("resolveNewSessionProvider: omitted stays claude (pre-existing default)", () => {
+  assert.equal(resolveNewSessionProvider(undefined), "claude");
+  assert.equal(resolveNewSessionProvider(null), "claude");
+  assert.equal(resolveNewSessionProvider(""), "claude");
+});
+
+test("resolveNewSessionProvider: an explicit cursor request selects cursor", () => {
+  assert.equal(resolveNewSessionProvider("cursor"), "cursor");
+  assert.equal(resolveNewSessionProvider("Cursor"), "cursor");
+  assert.equal(resolveNewSessionProvider("cursor-agent"), "cursor");
+});
+
+test("resolveNewSessionProvider: claude/codex still resolve to themselves", () => {
+  assert.equal(resolveNewSessionProvider("claude"), "claude");
+  assert.equal(resolveNewSessionProvider("codex"), "codex");
+});
+
+test("resolveNewSessionProvider: an unknown provider is rejected, never defaulted", () => {
+  assert.throws(() => resolveNewSessionProvider("gemini"), InvalidProviderError);
+  assert.throws(() => resolveNewSessionProvider("gemini"), /unknown provider "gemini"/);
+});
+
+test("resolveNewSessionProvider: a non-string provider is rejected", () => {
+  assert.throws(() => resolveNewSessionProvider(42), InvalidProviderError);
+  assert.throws(() => resolveNewSessionProvider({ kind: "cursor" }), InvalidProviderError);
+});
+
+test("resolveNewSessionProvider: an Object.prototype key is rejected, not resolved to a function", () => {
+  // the allowlist must not answer inherited keys — otherwise `__proto__` /
+  // `constructor` would arrive here as a truthy non-provider and pass.
+  for (const key of ["__proto__", "constructor", "toString", "valueOf"]) {
+    assert.throws(() => resolveNewSessionProvider(key), InvalidProviderError, key);
+  }
+});
+
+test("resolveNewSessionProvider: a shell-flavoured value is rejected, not passed through", () => {
+  // Nothing here ever reaches a shell (herdr gets `kind` as a JSON param), but
+  // the allowlist is what guarantees that — so keep it under test.
+  assert.throws(() => resolveNewSessionProvider("cursor; rm -rf /"), InvalidProviderError);
+  assert.throws(() => resolveNewSessionProvider("claude --dangerously-skip-permissions"), InvalidProviderError);
+});
+
+// ── agent kind threading: createNewSession → rpc.startAgent → herdr ──────────
+
+test("createNewSession: starts kind claude when no agentKind is given", async () => {
+  let started: string | undefined;
+  const rpc = fakeRpc({ startAgent: async (opts) => { started = opts.kind; } });
+  await createNewSession(rpc, { cwd: "/tmp", sessionLabel: "jeeves", sleep: noopSleep });
+  assert.equal(started, "claude");
+});
+
+test("createNewSession: passes the requested agent kind through to startAgent", async () => {
+  let started: string | undefined;
+  const rpc = fakeRpc({ startAgent: async (opts) => { started = opts.kind; } });
+  await createNewSession(rpc, { cwd: "/tmp", sessionLabel: "jeeves", agentKind: "cursor", sleep: noopSleep });
+  assert.equal(started, "cursor");
 });
 
 // ── shouldAutoTrustCwd: review finding #2 — Claude's startup workspace-trust

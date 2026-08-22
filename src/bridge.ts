@@ -15,6 +15,7 @@ import { HookTurnTracker } from "./hook-fsm.js";
 import type { HookReport } from "./hook-report.js";
 import { backstopOnPrompt } from "./hook-backstop.js";
 import { ScreenTimeline } from "./screen-timeline.js";
+import { hasTranscript, normalizeProvider, providerForAgent, type Provider } from "./provider.js";
 import { OutputStream } from "./output-stream.js";
 import { renderForGlasses } from "./render.js";
 import {
@@ -257,8 +258,15 @@ export class PaneBridge {
     this.state = toAppState(info.status);
   }
 
-  get provider(): string {
-    return this.agent === "codex" ? "codex" : "claude";
+  get provider(): Provider {
+    return providerForAgent(this.agent);
+  }
+
+  /** Whether this pane's agent has a structured transcript parser. Keyed on the
+   *  RAW agent kind (normalizeProvider), not on `provider` — an unrecognized
+   *  kind reports `claude` to the app but must still fall back to the screen. */
+  private get transcriptBacked(): boolean {
+    return hasTranscript(normalizeProvider(this.agent));
   }
 
   start(): void {
@@ -285,11 +293,12 @@ export class PaneBridge {
    *  unstable screen scrape (boot banners, MCP noise, diff heuristics) — that
    *  fallback only degraded the pre-transcript window. Anything the agent wrote
    *  before the upgrade is accepted as a small gap. Only an agent with no
-   *  transcript parser still falls back to the screen. */
+   *  transcript parser (cursor, and any kind we don't recognize) still falls
+   *  back to the screen. */
   private selectTimeline(): void {
     if (this.agentSessionId && this.upgradeToTranscript(this.agentSessionId)) return;
     this.onTranscript = false;
-    if (this.agent === "claude" || this.agent === "codex") {
+    if (this.transcriptBacked) {
       this.timeline = null; // wait for the transcript; the poll keeps retrying
       return;
     }
@@ -308,7 +317,13 @@ export class PaneBridge {
   }
 
   private upgradeToTranscript(id: string, fromStart = false): boolean {
-    if (this.agent === "claude") {
+    // Which parser (if any) is keyed on the NORMALIZED agent kind — the same
+    // question `transcriptBacked` answers. A raw string compare here could
+    // disagree with it for an alias or odd-cased kind, and the two must never
+    // diverge: `transcriptBacked` true + no matching branch = a pane that waits
+    // for a transcript no branch will ever attach, i.e. permanently blank.
+    const provider = normalizeProvider(this.agent);
+    if (provider === "claude") {
       const file = findSessionFile(id);
       if (!file) return false;
       // The outgoing timeline is the screen fallback (first upgrade) OR a prior
@@ -324,7 +339,7 @@ export class PaneBridge {
       console.log(`[bridge ${this.paneId}] tailing transcript ${file}${fromStart ? " (from start)" : ""}`);
       return true;
     }
-    if (this.agent === "codex") {
+    if (provider === "codex") {
       const file = findCodexSessionFile(id);
       if (!file) return false;
       const outgoing = this.timeline;
@@ -337,7 +352,7 @@ export class PaneBridge {
       console.log(`[bridge ${this.paneId}] tailing codex transcript ${file}${fromStart ? " (from start)" : ""}`);
       return true;
     }
-    return false;
+    return false; // cursor / unrecognized kind: no parser — stays on the screen
   }
 
   /** While a turn runs, push a live elapsed/token counter every 10s. The app
@@ -386,6 +401,10 @@ export class PaneBridge {
    *  so the mux drives the session as before. */
   noteSessionId(id: string, source: "hook" | "mux" = "mux"): void {
     if (this.disposed || !id) return;
+    // A screen-only agent (cursor) has no transcript parser, so there is nothing
+    // to upgrade to: remembering the id would only park it in pendingSessionId
+    // and make the poll retry an upgrade that can never succeed.
+    if (!this.transcriptBacked) return;
     if (source === "mux" && this.hookSessionKnown) return; // hook owns the session once known
     // A report of the CURRENT tail is a no-op for the tail itself. A stale mux snapshot must
     // NOT clear a pending move (it may just be lagging); but an AUTHORITATIVE hook report that
@@ -433,7 +452,7 @@ export class PaneBridge {
         !this.polling &&
         !this.onTranscript &&
         !this.hookSessionKnown && // once a hook session is known it owns it — don't mux-fetch
-        (this.agent === "claude" || this.agent === "codex") &&
+        this.transcriptBacked && // a screen-only agent (cursor) has no transcript to upgrade to
         Date.now() - this.lastUpgradeTryMs >= TRANSCRIPT_RETRY_MS
       ) {
         this.lastUpgradeTryMs = Date.now();

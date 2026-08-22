@@ -1,6 +1,5 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { networkInterfaces } from "node:os";
-import path from "node:path";
 import readline from "node:readline";
 import express from "express";
 import type { NextFunction, Request, Response } from "express";
@@ -28,12 +27,22 @@ import { CmuxMultiplexer, cmuxAvailable } from "./cmux.js";
 import {
   createNewSession,
   resolveNewSessionCwd,
+  resolveNewSessionProvider,
   shouldAutoTrustCwd,
   waitForAttach,
   InvalidCwdError,
+  InvalidProviderError,
   type NewSessionRpc,
 } from "./new-session.js";
-import { readClaudeHistory, readCodexHistory, clampHistoryLimit } from "./history.js";
+import { readHistory, clampHistoryLimit } from "./history.js";
+import {
+  hasScreenModel,
+  hasTranscript,
+  herdrAgentKind,
+  providerForAgent,
+  sessionTitle,
+  type Provider,
+} from "./provider.js";
 import { logEvent, eventLogPath, logMode, writesEventLog, consoleLogPath, installConsoleTee } from "./log.js";
 import { extractModel, isClaudeTrustPrompt } from "./parse.js";
 import { readClaudeModel } from "./transcript.js";
@@ -162,11 +171,7 @@ function resolveToken(): string {
   return randomBytes(24).toString("hex");
 }
 const TOKEN = resolveToken();
-let defaultProvider = "claude";
-
-function providerForAgent(agent: string | undefined): "codex" | "claude" {
-  return agent === "codex" ? "codex" : "claude";
-}
+let defaultProvider: Provider = "claude";
 
 function normalizeBasePath(raw: string | undefined): string {
   if (!raw || raw === "/") return "";
@@ -298,7 +303,7 @@ api.get("/sessions", async (_req, res) => {
     const agents = await refreshAgents();
     const sessions = agents.map((a) => ({
       id: a.paneId,
-      title: `${a.agent} · ${path.basename(a.cwd || "/")}`,
+      title: sessionTitle(a.agent, a.cwd),
       timestamp: new Date().toISOString(),
       cwd: a.cwd,
       provider: providerForAgent(a.agent),
@@ -312,21 +317,26 @@ api.get("/sessions", async (_req, res) => {
 
 api.get("/info", async (_req, res) => {
   let model = "";
-  let provider: "codex" | "claude" = "claude";
+  let provider: Provider = "claude";
   try {
     const agents = await refreshAgents();
     const target = agents.find((a) => a.focused) ?? agents[0];
     provider = providerForAgent(target?.agent);
     // Prefer the structured model from the transcript (works for codex too, and
     // is exact); fall back to the claude status-bar scrape only if no session id
-    // exists yet.
-    if (target?.sessionId) {
+    // exists yet. A provider with no transcript parser (cursor) is skipped
+    // entirely rather than parsed as Claude — it reports model "Unknown".
+    if (target?.sessionId && hasTranscript(provider)) {
       model =
-        (target.agent === "codex"
+        (provider === "codex"
           ? readCodexModel(target.sessionId)
           : readClaudeModel(target.sessionId)) ?? "";
     }
-    if (!model && target?.agent === "claude") {
+    // The status-bar scrape is Claude's TUI only, so it is gated on the
+    // normalized RAW agent kind (hasScreenModel) rather than on `provider` —
+    // an unrecognized kind reports provider `claude` but paints some other
+    // agent's screen, and scraping that would invent a model.
+    if (!model && target && hasScreenModel(target.agent)) {
       model = extractModel(await getMux().read(target.paneId, 5));
     }
   } catch {
@@ -350,9 +360,11 @@ api.get("/update-check", (_req, res) => {
 
 // Real Herdr wiring for the New Session flow (src/new-session.ts). The agent
 // launches without extra CLI args — a New Session pane behaves exactly like a
-// `claude` a human typed into a fresh pane, including normal interactive
-// permission prompts (handled by the existing PaneBridge machinery), rather
-// than silently granting --dangerously-skip-permissions.
+// `claude` (or `cursor`) a human typed into a fresh pane, including normal
+// interactive permission prompts (handled by the existing PaneBridge
+// machinery), rather than silently granting --dangerously-skip-permissions.
+// The agent kind travels as herdr's `agent.start` `kind` parameter, resolved
+// from a fixed provider allowlist — request text never reaches a command line.
 const herdrRpc: NewSessionRpc = {
   createWorkspace: (cwd, label) => workspaceCreate(cwd, label),
   startAgent: (opts) => agentStart(opts),
@@ -424,8 +436,16 @@ async function readStableScreen(mux: Multiplexer, paneId: string, maxAttempts = 
 // elsewhere in the bridge (e.g. waitUnblocked) rather than a single fixed
 // wait. If the pane is never picked up, waitForAttach closes the workspace
 // createNewSession already made (review finding #1) rather than leaking it.
-async function bridgeForNewSession(cwd: string, autoTrust: boolean): Promise<PaneBridge | undefined> {
-  const { paneId, workspaceId } = await createNewSession(herdrRpc, { cwd, sessionLabel: herdrSessionName() });
+async function bridgeForNewSession(
+  cwd: string,
+  autoTrust: boolean,
+  provider: Provider,
+): Promise<PaneBridge | undefined> {
+  const { paneId, workspaceId } = await createNewSession(herdrRpc, {
+    cwd,
+    sessionLabel: herdrSessionName(),
+    agentKind: herdrAgentKind(provider),
+  });
   if (autoTrust) await dismissStartupTrustPrompt(paneId);
   return waitForAttach(
     async () => {
@@ -448,10 +468,16 @@ async function isShowingTrustPrompt(paneId: string): Promise<boolean> {
 }
 
 api.post("/prompt", async (req, res) => {
-  const { text, sessionId, cwd } = (req.body ?? {}) as {
+  // `provider`/`kind`: which agent a New Session starts (claude | codex |
+  // cursor). Even Terminal clients differ on the field name, so both are
+  // accepted; both are ignored when `sessionId` names an existing pane, whose
+  // provider is whatever is already running there.
+  const { text, sessionId, cwd, provider: requestedProvider, kind } = (req.body ?? {}) as {
     text?: string;
     sessionId?: string;
     cwd?: unknown;
+    provider?: unknown;
+    kind?: unknown;
   };
   if (!text || typeof text !== "string") {
     res.status(400).json({ error: "Missing 'text' field" });
@@ -468,13 +494,18 @@ api.post("/prompt", async (req, res) => {
         bridge = focusedOrFirstBridge(agents);
       } else if (getMux().name === "herdr") {
         // A null sessionId ("New Session" in the app) creates a fresh Herdr
-        // workspace + Claude agent instead of routing to an existing one.
+        // workspace + agent instead of routing to an existing one. The provider
+        // defaults to claude when the client doesn't ask for one; an
+        // unrecognized value is a 400 rather than a silently wrong agent.
         // cwd was not supplied by the caller only when it's exactly undefined
         // (an explicit cwd, even one that resolves to the same path as the
         // default, is still caller-supplied for trust purposes).
-        const autoTrust = shouldAutoTrustCwd(cwd !== undefined);
-        bridge = await bridgeForNewSession(resolveNewSessionCwd(cwd), autoTrust);
-        if (bridge && !autoTrust && (await isShowingTrustPrompt(bridge.paneId))) {
+        const provider = resolveNewSessionProvider(requestedProvider ?? kind);
+        // The startup trust dialog is Claude's; only a Claude pane has one to
+        // auto-accept or to hold a prompt back for.
+        const autoTrust = provider === "claude" && shouldAutoTrustCwd(cwd !== undefined);
+        bridge = await bridgeForNewSession(resolveNewSessionCwd(cwd), autoTrust, provider);
+        if (bridge && provider === "claude" && !autoTrust && (await isShowingTrustPrompt(bridge.paneId))) {
           newSessionNeedsTrustApproval = true;
         }
       } else {
@@ -508,7 +539,7 @@ api.post("/prompt", async (req, res) => {
     await bridge.prompt(text);
     res.status(202).json({ ok: true, sessionId: bridge.paneId, provider: bridge.provider });
   } catch (err) {
-    const status = err instanceof InvalidCwdError ? 400 : 500;
+    const status = err instanceof InvalidCwdError || err instanceof InvalidProviderError ? 400 : 500;
     res.status(status).json({ error: (err as Error).message });
   }
 });
@@ -612,8 +643,10 @@ api.get("/sessions/:id/history", async (req, res) => {
     return;
   }
   try {
-    const history =
-      bridge.provider === "codex" ? await readCodexHistory(sessionId, limit) : await readClaudeHistory(sessionId, limit);
+    // readHistory picks the provider's parser — and returns [] for a provider
+    // with none (cursor), so a cursor pane answers 200 + empty history instead
+    // of having its session id parsed as Claude jsonl (see src/history.ts).
+    const history = await readHistory(bridge.provider, sessionId, limit);
     res.json({ history });
   } catch (err) {
     res.json({ history: [], error: (err as Error).message });
@@ -705,7 +738,9 @@ const server = app.listen(listenPort, bind.bindHost, async () => {
       console.log(`  agent : ${a.agent} pane=${a.paneId} status=${a.status} cwd=${a.cwd}`);
     }
     if (agents.length === 0) {
-      console.log(`  agent : none yet — start claude or codex inside ${getMux().name}; it's picked up automatically (no restart).`);
+      console.log(
+        `  agent : none yet — start claude, codex, or cursor inside ${getMux().name}; it's picked up automatically (no restart).`,
+      );
     }
   } catch (err) {
     console.error(`  ${getMux().name} : NOT REACHABLE — ${(err as Error).message}`);

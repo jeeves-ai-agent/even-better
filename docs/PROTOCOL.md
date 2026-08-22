@@ -69,7 +69,7 @@ All under `/api`, bearer-token auth (`?token=` or `Authorization: Bearer`).
 | GET | `/messages` | ring-buffer replay (`?after=`) |
 | GET | `/update-check` | version check (static) |
 | GET | `/sessions/:id/history?limit=` | recent turns from the session's transcript |
-| POST | `/prompt` | inject a user turn (`{ text, sessionId, cwd? }`) — see [New Session](#new-session-sessionid-null) |
+| POST | `/prompt` | inject a user turn (`{ text, sessionId, cwd?, provider? }`) — see [New Session](#new-session-sessionid-null) |
 | POST | `/permission-response` | answer a `permission_request` (`{ sessionId, decision }`) |
 | POST | `/question-response` | answer a `user_question` (`{ sessionId, answer }`) |
 | POST | `/interrupt` | send Escape to the pane (`{ sessionId }`) |
@@ -89,16 +89,31 @@ route), not the provider's raw session id — resolved via
 `bridge.agentSessionId`, no second discovery path; and the cap is **50**
 (`MAX_HISTORY_LIMIT`), not 0.8.1's 10.
 
+⚠️ **Cursor limitation:** a `cursor` pane has **no transcript parser** (Cursor
+CLI support mirrors the screen — see [Providers](#providers)), so its history is
+always `{ history: [] }` with **HTTP 200**. Its session id is deliberately never
+handed to the Claude parser (`readHistory` in `src/history.ts`), which would at
+best find nothing and at worst replay an unrelated Claude session with a
+colliding id.
+
 ### New Session (`sessionId: null`)
 
 On the Herdr backend, `POST /prompt` with `sessionId: null` creates a
-brand-new workspace and starts a Claude agent in it, instead of routing to an
+brand-new workspace and starts an agent in it, instead of routing to an
 existing pane (`focusedOrFirstBridge`) — see `src/new-session.ts`. An
 optional `cwd` must be an absolute, existing directory (**400** otherwise);
 omitted, it falls back to `NEW_SESSION_CWD`, then `HOME`, then the server's
-own cwd. On any failure after the workspace exists (agent start, readiness,
-or the caller never picking up the new pane), the workspace is closed rather
-than leaked.
+own cwd. An optional `provider` (clients that name the field `kind` are
+accepted too) selects which agent to start — `claude` (the default when the
+field is absent), `codex`, or `cursor`; herdr is started with the matching
+`--kind`. The value is resolved against a fixed allowlist
+(`resolveNewSessionProvider`), so an unknown one is a **400** rather than a
+silently different agent, and only the resolved constant — never request text —
+reaches herdr, as an `agent.start` JSON parameter (no shell command is built
+from it). Both fields are ignored when `sessionId` names an existing pane,
+whose provider is whatever already runs there. On any failure after the
+workspace exists (agent start, readiness, or the caller never picking up the new
+pane), the workspace is closed rather than leaked.
 
 Claude's one-time workspace-trust dialog is auto-accepted **only** for that
 server-default cwd (an operator-controlled value); a caller-supplied `cwd`
@@ -106,8 +121,25 @@ leaves the dialog for a human to approve instead of silently granting it —
 the response is `{ ok: false, sessionId, provider, error: "trust_required",
 message }` and the dialog surfaces as a normal `user_question` the app can
 answer via `/question-response`, after which the same `sessionId` accepts a
-normal prompt. cmux has no equivalent named-workspace API yet, so a null
-`sessionId` there keeps the pre-feature `focusedOrFirstBridge` fallback.
+normal prompt. That dialog is Claude's, so the auto-accept and the
+`trust_required` hold-back apply to a `claude` New Session only. cmux has no
+equivalent named-workspace API yet, so a null `sessionId` there keeps the
+pre-feature `focusedOrFirstBridge` fallback.
+
+### Providers
+
+`provider` is `claude` | `codex` | `cursor` (`src/provider.ts` — the one place
+an agent kind is mapped, used by `/sessions`, `/info`, `/status`, `result`, and
+New Session). herdr's `cursor-agent` / `cursor-cli` kinds resolve to `cursor`;
+an agent kind we don't recognize still reports `claude`, as before.
+
+Only claude and codex have transcript parsers. A `cursor` pane therefore:
+mirrors its pane **screen** (`ScreenTimeline`, the existing fallback) instead of
+a jsonl; reports `model: "Unknown"` from `/info` (no transcript to read a model
+from, and the status-bar scrape is Claude's); and returns an empty history (see
+[History](#history)). Status, prompts, interrupt, and the screen-parsed
+permission/question flow are the normal provider-neutral paths and work
+unchanged. Cursor transcript parsing / ACP is out of scope.
 
 ## Transport & resilience
 

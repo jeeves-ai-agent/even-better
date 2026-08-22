@@ -38,7 +38,10 @@ means different things:**
   pre-transcript window with boot/TUI noise). The pane stays listed and its
   permission menus are still read from the screen; only streamed content waits on
   the transcript. (herdr 0.7.2+ exposes the session via built-in detection, so this
-  mostly affects older herdr / non-standard transcript paths.)
+  mostly affects older herdr / non-standard transcript paths.) A **cursor** pane
+  has no transcript parser at all, so it is mirrored from the screen
+  (`ScreenTimeline`) and never waits on a session id — see `docs/PROTOCOL.md`
+  §Providers.
 
 **Related host limitation (one agent type at a time):** even-better's `/api/info`
 and the QR connection report a **single** `provider` — the focused/first agent's

@@ -25,9 +25,13 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
 - **`transcript.ts`** — `TranscriptTimeline`: parses Claude's session jsonl.
   Structured, lossless, **no heuristics**.
 - **`screen-timeline.ts`** — `ScreenTimeline`: TUI-scraping content source for
-  agents with **no transcript parser** (claude/codex are transcript-only — see the
-  invariant below). **All** fragile heuristics (diff, volatile-line filter, dedup,
-  echo suppression) live here and nowhere else.
+  agents with **no transcript parser** (cursor today; claude/codex are
+  transcript-only — see the invariant below). **All** fragile heuristics (diff,
+  volatile-line filter, dedup, echo suppression) live here and nowhere else.
+- **`provider.ts`** — which agent a pane runs (`claude|codex|cursor`) and the one
+  capability that differs: whether it has a transcript parser. Every surface
+  (`/sessions`, `/info`, history, New Session) asks here instead of re-deriving a
+  provider from an agent string. Not an `AgentAdapter` — see the roadmap below.
 - **`render.ts`** — pure `string→string` glasses transforms (table reflow, box
   strip). Applied before emit.
 - **`multiplexer.ts`** — the `Multiplexer` seam (pane I/O) + normalized
@@ -74,8 +78,8 @@ Multiplexer(herdr) × Agent(claude)  →  AgentEvent stream  →  Sink (render +
   bridge shows no content (the poll keeps retrying the upgrade), rather than
   degrading to the `ScreenTimeline` scrape — that only ever mirrored boot/TUI
   noise in the pre-transcript window. `ScreenTimeline` as a *content* source is
-  now reserved for agents with no transcript parser. The screen is still read for
-  the **interaction layer** (permission menus, codex approval detection) — that is
+  now reserved for agents with no transcript parser (cursor). The screen is still
+  read for the **interaction layer** (permission menus, codex approval detection) — that is
   a separate direct read, not this content path. Dedup/filtering remain **screen
   artifacts** confined to `ScreenTimeline`, never in the core.
 - **Text is append-only on the app side.** Once a `text_delta` is sent it cannot
@@ -146,9 +150,11 @@ glasses show something wrong. `LOG=trace` traces capture/send/drop per line.
 bar was met by a named second backend. `AgentAdapter` is **not** yet: claude and
 codex still live as branches in `bridge.ts`/transcript parsers, and that is
 fine until agent-specific behavior grows beyond timeline parsing and menu/key
-grammar. Do not extract it (or the `src/source/` subtree) on symmetry alone. No
-`Renderer`/`Transport` interfaces while there is one device and one protocol;
-keep render as pure functions.
+grammar. Cursor did not move that bar: it adds no agent-specific behavior at all
+(no transcript parser, no key grammar of its own), only the identity + one
+capability flag in `provider.ts`. Do not extract it (or the `src/source/`
+subtree) on symmetry alone. No `Renderer`/`Transport` interfaces while there is
+one device and one protocol; keep render as pure functions.
 
 ## Git
 

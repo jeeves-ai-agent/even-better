@@ -120,6 +120,8 @@ See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 - Cost isn't computed (token counts are reported; `costUsd` is always 0).
 - A claude/codex pane shows content only from its structured transcript — a fresh
   agent shows nothing until its session's jsonl exists (no lossy screen scraping).
+- A cursor pane (Cursor CLI) has no transcript parser: it is mirrored from the
+  pane screen, reports model `Unknown`, and its history is always empty.
 - Permission menus are read from the screen; exotic prompts fall back to a
   "check your terminal" notification.
 - even-better only *mirrors* — it won't start a brand-new session from the

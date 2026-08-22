@@ -9,6 +9,7 @@
 import { findSessionFile, parseEntry } from "./transcript.js";
 import { CodexEntryParser, findCodexSessionFile } from "./codex-transcript.js";
 import { JsonlTail } from "./jsonl-tail.js";
+import { hasTranscript, type Provider } from "./provider.js";
 import type { AgentEvent } from "./spine.js";
 
 export interface HistoryItem {
@@ -71,4 +72,24 @@ export async function readCodexHistory(sessionId: string, limit: number): Promis
   } catch {
     return [];
   }
+}
+
+/** History for whichever provider a pane runs — the one entry point the HTTP
+ *  route uses, so no call site has to re-decide which parser a provider gets.
+ *
+ *  LIMITATION (cursor): the Cursor CLI has no transcript parser here (its
+ *  session log format is deliberately out of scope, like its live content —
+ *  cursor mirrors the screen, see PaneBridge.selectTimeline), so its history is
+ *  always empty. It must NOT fall through to readClaudeHistory: a cursor pane's
+ *  session id is not a Claude session id, and parsing it as one would either
+ *  return nothing or, worse, replay an unrelated Claude session that happens to
+ *  share the id. Empty + HTTP 200 matches the route's fail-soft contract (see
+ *  docs/PROTOCOL.md §History). */
+export async function readHistory(
+  provider: Provider,
+  sessionId: string,
+  limit: number,
+): Promise<HistoryItem[]> {
+  if (!hasTranscript(provider)) return [];
+  return provider === "codex" ? readCodexHistory(sessionId, limit) : readClaudeHistory(sessionId, limit);
 }

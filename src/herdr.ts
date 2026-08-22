@@ -249,14 +249,23 @@ export async function workspaceClose(workspaceId: string): Promise<void> {
   await call("workspace.close", { workspace_id: workspaceId });
 }
 
-/** Starts a Claude agent in an existing pane (must be at its interactive shell
- *  prompt — true for a pane workspaceCreate just made). Returns as soon as the
- *  launch is accepted; it does NOT wait for interactive readiness — poll
+/** Starts an agent in an existing pane (must be at its interactive shell
+ *  prompt — true for a pane workspaceCreate just made). `kind` is herdr's agent
+ *  kind (`claude` | `codex` | `cursor`, see provider.ts's herdrAgentKind);
+ *  omitted it stays `claude`, the pre-existing default. It travels as a JSON-RPC
+ *  parameter — herdr builds the command line, so no caller value is ever
+ *  interpolated into a shell command here. Returns as soon as the launch is
+ *  accepted; it does NOT wait for interactive readiness — poll
  *  paneInteractiveReady for that (see new-session.ts's waitUntilReady). */
-export async function agentStart(opts: { name: string; paneId: string; timeoutMs: number }): Promise<void> {
+export async function agentStart(opts: {
+  name: string;
+  paneId: string;
+  timeoutMs: number;
+  kind?: string;
+}): Promise<void> {
   const params = {
     name: opts.name,
-    kind: "claude",
+    kind: opts.kind ?? "claude",
     pane_id: opts.paneId,
     timeout_ms: opts.timeoutMs,
   };
