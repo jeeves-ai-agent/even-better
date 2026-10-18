@@ -214,10 +214,35 @@ export function classifyMenu(menu: ParsedMenu): ClassifiedMenu {
  * mistaken for it and auto-approved.
  */
 export function isClaudeTrustPrompt(text: string): boolean {
-  const menu = parseMenu(text);
-  if (!menu || menu.options.length !== 2) return false;
-  const [first, second] = menu.options;
-  return /^yes,\s*i trust this folder$/i.test(first.label.trim()) && /^no,\s*exit$/i.test(second.label.trim());
+  return claudeTrustPromptKey(text) !== null;
+}
+
+/**
+ * The key that moves Claude's trust dialog toward "Yes, I trust this folder":
+ * "Enter" only when that option is the highlighted (`❯`) one, otherwise the
+ * arrow that moves the highlight onto it; null when the dialog isn't on screen.
+ * Claude has shipped both layouts — numbered with Yes first (`❯ 1. Yes, I
+ * trust this folder` / `2. No, exit`) and, since ~v2.1.251, unnumbered with
+ * "No, exit" first and highlighted — so neither order nor parseMenu (which
+ * needs numbers) can be assumed, and a blind Enter would pick "No, exit" and
+ * quit Claude.
+ */
+export function claudeTrustPromptKey(text: string): "Enter" | "Down" | "Up" | null {
+  let yes = -1;
+  let no = -1;
+  let marked = -1;
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/^\s*([❯›]\s*)?(?:\d[.)]\s+)?(.+?)\s*$/);
+    if (!m) continue;
+    if (/^yes,\s*i trust this folder$/i.test(m[2])) yes = i;
+    else if (/^no,\s*exit$/i.test(m[2])) no = i;
+    else continue;
+    if (m[1]) marked = i;
+  }
+  if (yes < 0 || no < 0 || Math.abs(yes - no) > 2) return null;
+  if (marked === yes) return "Enter";
+  return yes > no ? "Down" : "Up";
 }
 
 export function isCodexApprovalScreen(text: string): boolean {

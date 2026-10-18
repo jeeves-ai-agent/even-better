@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseMenu, classifyMenu, isCodexApprovalScreen, isClaudeTrustPrompt } from "../src/parse.js";
+import { parseMenu, classifyMenu, isCodexApprovalScreen, isClaudeTrustPrompt, claudeTrustPromptKey } from "../src/parse.js";
 
 // Representative screens captured live from the real TUIs. The highlighted
 // option carries a per-agent selection marker: `❯` (claude), `›` (codex).
@@ -168,3 +168,38 @@ const trustLookalikeToolPrompt = [
 ].join("\n");
 test("a tool-permission prompt merely mentioning 'trust' is not mistaken for the dialog", () =>
   assert.ok(!isClaudeTrustPrompt(trustLookalikeToolPrompt)));
+
+// Claude Code ~v2.1.251+ (captured live 2026-10-18): unnumbered, "No, exit"
+// first and highlighted. A blind Enter here quits Claude.
+const claudeTrustPromptNoFirst = [
+  " Accessing workspace:",
+  " /tmp/eb-trust-o038",
+  " Quick safety check: Is this a project you created or one you trust? (Like your own code, a",
+  " well-known open source project, or work from your team). If not, take a moment to review what's in",
+  " this folder first.",
+  " Claude Code'll be able to read, edit, and execute files here.",
+  " Security guide",
+  " ❯ No, exit",
+  "   Yes, I trust this folder",
+  " Enter to confirm · Esc to cancel",
+].join("\n");
+test("trust key: Enter when Yes is highlighted (numbered, Yes-first layout)", () =>
+  assert.equal(claudeTrustPromptKey(claudeTrustPrompt), "Enter"));
+test("trust key: Down, never Enter, when No is highlighted (unnumbered, No-first layout)", () =>
+  assert.equal(claudeTrustPromptKey(claudeTrustPromptNoFirst), "Down"));
+test("trust key: Enter once the highlight has moved onto Yes (No-first layout)", () =>
+  assert.equal(
+    claudeTrustPromptKey(claudeTrustPromptNoFirst.replace(" ❯ No, exit", "   No, exit").replace("   Yes, I trust", " ❯ Yes, I trust")),
+    "Enter",
+  ));
+test("trust key: Up when No is highlighted in the Yes-first layout", () =>
+  assert.equal(
+    claudeTrustPromptKey(claudeTrustPrompt.replace(" ❯ 1. Yes", "   1. Yes").replace("   2. No", " ❯ 2. No")),
+    "Up",
+  ));
+test("unnumbered No-first trust dialog detected", () => assert.ok(isClaudeTrustPrompt(claudeTrustPromptNoFirst)));
+test("trust key: null for a tool prompt or prose", () => {
+  assert.equal(claudeTrustPromptKey(claudePerm), null);
+  assert.equal(claudeTrustPromptKey(trustLookalikeToolPrompt), null);
+  assert.equal(claudeTrustPromptKey("just some output\nwith no menu here"), null);
+});

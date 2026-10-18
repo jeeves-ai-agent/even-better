@@ -44,7 +44,7 @@ import {
   type Provider,
 } from "./provider.js";
 import { logEvent, eventLogPath, logMode, writesEventLog, consoleLogPath, installConsoleTee } from "./log.js";
-import { extractModel, isClaudeTrustPrompt } from "./parse.js";
+import { claudeTrustPromptKey, extractModel, isClaudeTrustPrompt } from "./parse.js";
 import { readClaudeModel } from "./transcript.js";
 import { readCodexModel } from "./codex-transcript.js";
 import { startExpose, exposeProviderNames } from "./expose.js";
@@ -399,8 +399,10 @@ async function dismissStartupTrustPrompt(paneId: string): Promise<void> {
   for (let attempt = 0; attempt < 10; attempt++) {
     const screen = await readStableScreen(mux, paneId);
     if (screen === null) return; // pane gone
-    if (!isClaudeTrustPrompt(screen)) return; // stable AND not the dialog — genuinely done
-    await mux.send(paneId, "", ["Enter"]);
+    const key = claudeTrustPromptKey(screen);
+    if (key === null) return; // stable AND not the dialog — genuinely done
+    // Enter only once "Yes" is highlighted; otherwise move onto it and re-read.
+    await mux.send(paneId, "", [key]);
   }
 }
 
